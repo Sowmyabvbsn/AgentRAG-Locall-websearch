@@ -1,0 +1,24 @@
+# Core LLM + Transformers + Quantization
+torch
+torchvision
+transformers
+accelerate
+bitsandbytes
+
+# LangChain + Extensions + Vector Store
+langchain
+langchain-community
+chromadb
+# Retrieval & Ingestion
+duckduckgo-search
+pypdf
+# Sentence Embeddings
+sentence-transformers
+
+# NLP
+spacy
+
+# Frontend / UI
+gradio
+
+

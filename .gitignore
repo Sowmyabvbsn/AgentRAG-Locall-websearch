@@ -1,0 +1,34 @@
+# Typical Python ignores
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+*.log
+
+# Environments and dependencies
+venv/
+env/
+.venv/
+
+# Byte-compiled / optimized / DLL files
+*.so
+*.dylib
+*.dll
+
+# Editor/IDE settings
+.vscode/
+.idea/
+*.swp
+
+# IPython/Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Mac OS and other OS-generated files
+.DS_Store
+Thumbs.db
+
+# Local data / caches
+chroma_db/
+temp_uploads/
+local_model/
+local_embeddings/
