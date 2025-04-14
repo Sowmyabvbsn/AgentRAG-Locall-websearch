@@ -22,7 +22,7 @@ def sentence_based_split(
     for sentence in sentences:
         words = sentence.split()
         if len(words) > 100:
-            sub_sentences = [sentence[i : i + 100] for i in range(0, len(words), 100)]
+            sub_sentences = [" ".join(words[i: i + 100]) for i in range(0, len(words), 100)]
             words = " ".join(sub_sentences).split()
 
         if len(current_chunk_words) + len(words) > target_word_count:
@@ -31,10 +31,14 @@ def sentence_based_split(
                 chunks.append(chunk_text)
             else:
                 truncated_words = current_chunk_words.copy()
-                while truncated_words and len(tokenizer.encode(" ".join(truncated_words))) > max_tokens:
+                t_chunk = " ".join(truncated_words)
+                encoded = tokenizer.encode(t_chunk)
+                while truncated_words and len(encoded) > max_tokens:
                     truncated_words.pop()
+                    t_chunk = " ".join(truncated_words)
+                    encoded = tokenizer.encode(t_chunk)
                 if truncated_words:
-                    chunks.append(" ".join(truncated_words))
+                    chunks.append(t_chunk)
 
             if len(current_chunk_words) >= overlap_words:
                 current_chunk_words = current_chunk_words[-overlap_words:]

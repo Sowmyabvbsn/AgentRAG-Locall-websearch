@@ -8,7 +8,7 @@ from typing import Generator, List, Optional, Dict
 import gradio as gr
 import json
 import re
-
+import datetime
 from transformers import TextIteratorStreamer
 from langchain.docstore.document import Document
 from langchain.schema import SystemMessage
@@ -46,7 +46,8 @@ class TemplateAgent:
             "(e.g., 'Step 1: ...') without revealing any actual reasoning or final answer. "
             "This template must be adaptable to any user query and remain purely an outline. "
             f"\n\n{question}\n\n"
-            "Return only approach and steps for the reasoning steps and context, with no real details or final solution.\n\n"
+            "Return only approach and steps for the reasoning steps and context, with no real details or final "
+            "solution.\n\n"
             "Template:"
         )
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
@@ -58,7 +59,8 @@ class TemplateAgent:
         if not content.strip():
             return ""
         prompt = (
-            "Clean and refine the following context to fix spacing/phrasing issues, ensuring the meaning is preserved:\n\n"
+            "Clean and refine the following context to fix spacing/phrasing issues, ensuring the meaning is "
+            "preserved:\n\n"
             f"{content}\n\nRefined Context:"
         )
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
@@ -109,20 +111,63 @@ class CoTAgent:
         self.template_agent = TemplateAgent(self.model, self.tokenizer)
 
     def _process_documents(self, docs: List[Document]):
+        from langchain_community.vectorstores.utils import filter_complex_metadata
         new_docs = []
         for doc in docs:
-            # Use adaptive splitting from utils
+            doc_content = doc.page_content
+
+            # Detect multiple document types.
+            import re
+            doc_types = set()
+            # Detect code: look for code fences and typical code tokens.
+            if "```" in doc_content or "def " in doc_content or "import " in doc_content:
+                doc_types.add("code")
+            # Detect math symbols.
+            if any(math_sym in doc_content for math_sym in ["∫", "∑", "√", "π", "∞", "Δ", "lim"]):
+                doc_types.add("math")
+            # Remove code blocks to assess non-code text.
+            non_code_text = re.sub(r"```(.*?)```", "", doc_content, flags=re.DOTALL).strip()
+            if non_code_text and len(non_code_text.split()) > 10:
+                doc_types.add("text")
+            # If no type is detected, default to text.
+            if not doc_types:
+                doc_types.add("text")
+
+            # Extract a candidate title or section header.
+            content_stripped = doc.page_content.strip()
+            candidate_title = ""
+            if content_stripped:
+                first_line = content_stripped.splitlines()[0].strip()
+                if first_line.startswith("#"):
+                    candidate_title = first_line.lstrip("#").strip()
+                elif len(first_line.split()) <= 10:
+                    candidate_title = first_line
+
+            # Use adaptive splitting from utils.
             chunks = utils.adaptive_sentence_based_split(doc.page_content, max_tokens=512)
             for chunk in chunks:
                 clean_content = chunk.strip()
                 content_hash = hashlib.sha256(clean_content.encode()).hexdigest()
+                ingested_at = datetime.datetime.utcnow().isoformat()
+
+                # Create metadata with enforced fields and additional ingestion timestamp.
+                new_metadata = {**doc.metadata,
+                                "content_hash": content_hash,
+                                "ingested_at": ingested_at,
+                                "doc_type": list(doc_types)}
+                if candidate_title:
+                    new_metadata["section_title"] = candidate_title
+                if "source" not in new_metadata:
+                    new_metadata["source"] = "unknown"
+
+                # Filter out complex metadata types using provided utility:
+                filtered_docs = filter_complex_metadata([Document(page_content="", metadata=new_metadata)])
+                new_metadata = filtered_docs[0].metadata
 
                 new_doc = Document(
                     page_content=clean_content,
-                    metadata={**doc.metadata, "content_hash": content_hash}
+                    metadata=new_metadata
                 )
-                if "source" not in new_doc.metadata:
-                    new_doc.metadata["source"] = "unknown"
                 new_docs.append(new_doc)
 
         existing_hashes = set()
@@ -137,7 +182,9 @@ class CoTAgent:
 
         doc_count = self.vectorstore._collection.count()
         k = min(4, doc_count) if doc_count > 0 else 1
-        self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": k})
+        self.retriever = self.vectorstore.as_retriever(
+            search_kwargs={"k": k, "include_distances": True, "include_metadata": True}
+        )
 
     def update_urls(self, new_urls: List[str]):
         if set(new_urls) != set(self.current_urls):
@@ -214,18 +261,35 @@ class CoTAgent:
         lines = text.splitlines()
         formatted_lines = []
         in_list = False
+        in_code_block = False
+
         for line in lines:
-            line = line.strip()
-            if line.startswith(tuple(f"{i}." for i in range(1, 10))):
-                step_num = line.split(".")[0]
-                step_text = line.split(".", 1)[1].strip()
+            # Check for the start or end of a code block
+            if line.strip().startswith("```"):
+                # Toggle code block state
+                in_code_block = not in_code_block
+                # Append the triple-backtick line as-is
+                formatted_lines.append(line)
+                continue
+
+            # If inside a code block, preserve indentation/spacing as-is
+            if in_code_block:
+                formatted_lines.append(line)
+                continue
+
+            # Otherwise (not in a code block), do your existing formatting:
+            line_stripped = line.strip()
+            if line_stripped.startswith(tuple(f"{i}." for i in range(1, 10))):
+                step_num = line_stripped.split(".")[0]
+                step_text = line_stripped.split(".", 1)[1].strip()
                 formatted_lines.append(f"**Step {step_num}** - {step_text}")
                 in_list = True
-            elif in_list and line:
-                formatted_lines.append(f"- {line}")
+            elif in_list and line_stripped:
+                formatted_lines.append(f"- {line_stripped}")
             else:
-                formatted_lines.append(line)
+                formatted_lines.append(line_stripped)
                 in_list = False
+
         return "\n".join(formatted_lines)
 
     def generate_with_cot(self, question: str, urls: Optional[List[str]] = None, max_tokens: int = 1024) -> Generator[str, None, None]:
@@ -242,7 +306,10 @@ class CoTAgent:
             self.logger.info("Using cached retriever results.")
         else:
             try:
-                docs = self.retriever.invoke(question)
+                # Use similarity_search_with_score to get similarity scores alongside docs.
+                docs_with_scores = self.vectorstore.similarity_search_with_score(question, k=4)
+                docs = [doc for doc, score in docs_with_scores]
+                self.logger.info("Similarity scores: " + ", ".join(f"{score:.3f}" for _, score in docs_with_scores))
                 self.retriever_cache[cache_key] = docs
             except Exception as e:
                 self.logger.error(f"Error retrieving documents: {e}")
