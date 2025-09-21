@@ -193,6 +193,8 @@ class EnhancedCoTAgent:
         """Process multiple types of files using multimodal processor"""
         all_docs = []
         processed_files = []
+        failed_files = []
+        processing_summary = []
         
         for path in file_paths:
             self.logger.info(f"Processing file: {path}")
@@ -201,17 +203,48 @@ class EnhancedCoTAgent:
                 if docs:
                     all_docs.extend(docs)
                     processed_files.append(os.path.basename(path))
+                    # Get file type for summary
+                    file_ext = os.path.splitext(path)[1].lower()
+                    file_type = "unknown"
+                    if file_ext == '.pdf':
+                        file_type = "PDF"
+                    elif file_ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']:
+                        file_type = "Image"
+                    elif file_ext in ['.mp3', '.wav', '.m4a', '.flac', '.ogg']:
+                        file_type = "Audio"
+                    elif file_ext in ['.txt', '.md', '.rst']:
+                        file_type = "Text"
+                    
+                    processing_summary.append(f"{os.path.basename(path)} ({file_type}): {len(docs)} chunks")
                 else:
                     self.logger.warning(f"No content extracted from {path}")
+                    failed_files.append(os.path.basename(path))
                     
             except Exception as e:
                 self.logger.error(f"Error processing file {path}: {e}")
+                failed_files.append(f"{os.path.basename(path)} (Error: {str(e)[:50]}...)")
         
         if all_docs:
             self._process_documents(all_docs)
-            return f"Successfully processed {len(processed_files)} files: {', '.join(processed_files)}"
+            
+            result_parts = [
+                f"Successfully processed {len(processed_files)} out of {len(file_paths)} files",
+                f"Total document chunks created: {len(all_docs)}",
+                "",
+                "📋 **Processing Details:**"
+            ]
+            result_parts.extend([f"  • {summary}" for summary in processing_summary])
+            
+            if failed_files:
+                result_parts.extend([
+                    "",
+                    "⚠️ **Failed Files:**"
+                ])
+                result_parts.extend([f"  • {failed}" for failed in failed_files])
+            
+            return "\n".join(result_parts)
         
-        return "No valid files were processed."
+        return f"❌ No valid files were processed out of {len(file_paths)} files. Check file formats and try again."
 
     def search_query(self, query: str, max_results: int = 8) -> List[str]:
         """Search for relevant URLs using DuckDuckGo"""
@@ -394,27 +427,42 @@ def ingest_multimodal_files(files: List) -> str:
     
     global_agent = get_agent(str(uuid.uuid4()))
     
+    if not files:
+        return "❌ No files were uploaded. Please select one or more files to process."
+    
     file_paths = []
+    file_info = []
     os.makedirs("temp_uploads", exist_ok=True)
     
     try:
         for f in files or []:
             if isinstance(f, str):
                 file_paths.append(f)
+                file_info.append(os.path.basename(f))
             else:
-                tmp_path = os.path.join("temp_uploads", f.name)
-                with open(tmp_path, "wb") as out_file:
-                    out_file.write(f.read())
+                # Handle file objects from Gradio
+                if hasattr(f, 'name') and f.name:
+                    # f is already a file path from Gradio
+                    file_paths.append(f.name)
+                    file_info.append(os.path.basename(f.name))
+                else:
+                    # f is a file-like object, need to save it
+                    tmp_path = os.path.join("temp_uploads", getattr(f, 'name', f'uploaded_file_{len(file_paths)}'))
+                    with open(tmp_path, "wb") as out_file:
+                        out_file.write(f.read())
+                    file_paths.append(tmp_path)
+                    file_info.append(os.path.basename(tmp_path))
                 file_paths.append(tmp_path)
+                file_info.append(os.path.basename(tmp_path))
     except Exception as e:
         logger.error(f"Error processing uploaded files: {e}")
         return f"❌ Error processing files: {str(e)}"
 
-    if not file_paths:
-        return "No files were uploaded."
+    logger.info(f"📁 Processing {len(file_paths)} files: {', '.join(file_info)}")
     
     try:
-        return global_agent.ingest_multimodal_files(file_paths)
+        result = global_agent.ingest_multimodal_files(file_paths)
+        return f"✅ {result}\n\n📊 **Files processed:** {len(file_paths)}\n📝 **File list:** {', '.join(file_info)}"
     except Exception as e:
         logger.error(f"Error ingesting files: {e}")
         return f"❌ Error processing files: {str(e)}"
@@ -459,6 +507,17 @@ if __name__ == "__main__":
         border-left: 4px solid #28a745;
         padding: 15px;
         border-radius: 5px;
+    }
+    .file-upload {
+        border: 2px dashed #667eea;
+        border-radius: 10px;
+        padding: 20px;
+        text-align: center;
+        transition: border-color 0.3s ease;
+    }
+    .file-upload:hover {
+        border-color: #764ba2;
+        background-color: #f8f9ff;
     }
     @media (max-width: 768px) { 
         .gr-row { flex-direction: column; } 
@@ -551,18 +610,30 @@ if __name__ == "__main__":
                 **Supported file types:**
                 - 📄 **Documents**: PDF, TXT, MD
                 - 🖼️ **Images**: JPG, PNG, BMP, TIFF, WEBP (text extraction + image analysis)
-                - 🎵 **Audio**: MP3, WAV, M4A, FLAC (speech will be transcribed)
+                - 🎵 **Audio**: MP3, WAV, M4A, FLAC, OGG (speech will be transcribed)
+                
+                **Tips for best results:**
+                - Upload multiple files at once for batch processing
+                - Mix different file types (PDFs + images + audio) for comprehensive knowledge base
+                - Ensure images contain clear, readable text for OCR
+                - Audio files should have clear speech for accurate transcription
                 """)
                 
                 multimodal_files = gr.File(
-                    label="Select Files", 
+                    label="Select Multiple Files", 
                     file_count="multiple", 
-                    file_types=[".pdf", ".txt", ".md", ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".mp3", ".wav", ".m4a", ".flac", ".ogg"]
+                    file_types=[".pdf", ".txt", ".md", ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp", ".mp3", ".wav", ".m4a", ".flac", ".ogg"],
+                    height=200
                 )
+                
+                with gr.Row():
+                    clear_files_btn = gr.Button("🗑️ Clear Files", variant="secondary")
+                    
                 upload_btn = gr.Button("🚀 Process Files", variant="primary")
                 upload_status = gr.Textbox(label="Processing Status", elem_classes=["status-box"])
 
                 upload_btn.click(fn=ingest_multimodal_files, inputs=multimodal_files, outputs=upload_status)
+                clear_files_btn.click(lambda: None, outputs=multimodal_files)
 
             with gr.Tab("ℹ️ System Info"):
                 gr.Markdown("""
@@ -578,11 +649,18 @@ if __name__ == "__main__":
                 - 🌐 Web content ingestion
                 - 📚 Citation generation
                 - 🔗 Related link recommendations
+                - 📁 **Batch file processing** - Upload multiple files simultaneously
+                - 🔄 **Mixed media support** - Process PDFs, images, and audio together
                 
                 **Requirements**:
                 - Ollama must be running (`ollama serve`)
                 - Llama 3.2 1B model must be available (`ollama pull llama3.2:1b`)
                 - Nomic embedding model (`ollama pull nomic-embed-text`)
+                
+                **File Processing Limits:**
+                - Maximum file size: Depends on available system memory
+                - Supported formats: PDF, TXT, MD, JPG, PNG, BMP, TIFF, WEBP, MP3, WAV, M4A, FLAC, OGG
+                - Batch processing: Upload multiple files simultaneously for efficient processing
                 """)
                 
                 # System status check
