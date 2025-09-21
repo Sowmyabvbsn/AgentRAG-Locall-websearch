@@ -1,11 +1,9 @@
 import os
 import logging
-import torch
 import spacy
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from sentence_transformers import SentenceTransformer
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_ollama import OllamaLLM, OllamaEmbeddings
 from langchain_chroma import Chroma
+import ollama
 
 # ================================
 # GLOBAL SETTINGS & INIT
@@ -20,17 +18,9 @@ logger = logging.getLogger(__name__)
 # Load spaCy for text processing
 GLOBAL_NLP = spacy.load("en_core_web_sm")
 
-# GPU/CPU memory usage
-max_memory = {0: "11GB", "cpu": "30GB"}
-
-# Model / Embedding config
-# MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-# MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-# MODEL_NAME = "Qwen/Qwen2.5-0.5B"
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct-1M"
-MODEL_PATH = os.path.join("../local_model", MODEL_NAME)
-EMBEDDING_MODEL_NAME = 'sentence-transformers/all-mpnet-base-v2'
-EMBEDDING_MODEL_PATH = "../local_embeddings"
+# Ollama Model Configuration
+OLLAMA_MODEL_NAME = "llama2"
+OLLAMA_EMBEDDING_MODEL = "nomic-embed-text"
 CHROMA_PERSIST_DIR = "chroma_db"
 DEFAULT_URLS = [
     "https://lilianweng.github.io/posts/2023-06-23-agent/",
@@ -39,81 +29,105 @@ DEFAULT_URLS = [
 
 # Globals used by main
 GLOBAL_MODEL = None
-GLOBAL_TOKENIZER = None
 GLOBAL_EMBEDDINGS = None
 GLOBAL_VECTORSTORE = None
 GLOBAL_RETRIEVER = None
+GLOBAL_TOKENIZER = None
+
+def check_ollama_connection():
+    """Check if Ollama is running and accessible"""
+    try:
+        ollama.list()
+        logger.info("✅ Ollama connection successful")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ollama connection failed: {e}")
+        logger.error("Please ensure Ollama is running: 'ollama serve'")
+        return False
+
+def ensure_models_available():
+    """Ensure required models are available in Ollama"""
+    try:
+        models = ollama.list()
+        # Handle different response formats from ollama.list()
+        if isinstance(models, dict) and 'models' in models:
+            model_names = [model.get('name', model.get('model', '')) for model in models['models']]
+        else:
+            # Fallback for different API response format
+            model_names = [getattr(model, 'name', getattr(model, 'model', '')) for model in models]
+        
+        # Check for Llama2
+        if not any(OLLAMA_MODEL_NAME in name for name in model_names):
+            logger.info(f"📥 Pulling {OLLAMA_MODEL_NAME} model...")
+            ollama.pull(OLLAMA_MODEL_NAME)
+            logger.info(f"✅ {OLLAMA_MODEL_NAME} model ready")
+        
+        # Check for embedding model
+        if not any(OLLAMA_EMBEDDING_MODEL in name for name in model_names):
+            logger.info(f"📥 Pulling {OLLAMA_EMBEDDING_MODEL} model...")
+            ollama.pull(OLLAMA_EMBEDDING_MODEL)
+            logger.info(f"✅ {OLLAMA_EMBEDDING_MODEL} model ready")
+            
+    except Exception as e:
+        logger.warning(f"Could not verify models automatically: {e}")
+        logger.info("Attempting to pull models anyway...")
+        try:
+            ollama.pull(OLLAMA_MODEL_NAME)
+            ollama.pull(OLLAMA_EMBEDDING_MODEL)
+            logger.info("✅ Models pulled successfully")
+        except Exception as pull_error:
+            logger.error(f"Failed to pull models: {pull_error}")
+            logger.error("Please manually run: ollama pull llama2 && ollama pull nomic-embed-text")
 
 def init_global_components():
     """
-    Loads or downloads the model/tokenizer, sets up embeddings,
-    and initializes Chroma's vector store and retriever.
+    Initialize Ollama models, embeddings, and Chroma vector store
     """
-    global GLOBAL_MODEL, GLOBAL_TOKENIZER, GLOBAL_EMBEDDINGS, GLOBAL_VECTORSTORE, GLOBAL_RETRIEVER
+    global GLOBAL_MODEL, GLOBAL_EMBEDDINGS, GLOBAL_VECTORSTORE, GLOBAL_RETRIEVER, GLOBAL_TOKENIZER
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    model_files_exist = os.path.exists(MODEL_PATH) and os.path.exists(os.path.join(MODEL_PATH, "config.json"))
-    if model_files_exist:
-        try:
-            logger.info(f"Loading local model from {MODEL_PATH}")
-            GLOBAL_MODEL = AutoModelForCausalLM.from_pretrained(
-                MODEL_PATH,
-                device_map="auto",
-                trust_remote_code=True,
-                max_memory=max_memory
-            )
-            GLOBAL_TOKENIZER = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
-            logger.info("✅ Local model loaded")
-        except Exception as e:
-            logger.warning(f"Local model corrupted or incomplete: {e}. Downloading model.")
-            model_files_exist = False
-
-    if not model_files_exist:
-        # BitsAndBytes configs for 8-bit
-        from transformers import BitsAndBytesConfig
-        quant_config_int8 = BitsAndBytesConfig(
-            load_in_8bit=True,
-            bnb_8bit_compute_dtype=torch.int8
-        )
-        logger.info(f"Downloading model: {MODEL_NAME}")
-        GLOBAL_MODEL = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            device_map="auto",
-            quantization_config=quant_config_int8,
-            torch_dtype=torch.float16,
-            trust_remote_code=True
-        )
-        GLOBAL_TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-        os.makedirs(MODEL_PATH, exist_ok=True)
-        GLOBAL_MODEL.save_pretrained(MODEL_PATH)
-        GLOBAL_TOKENIZER.save_pretrained(MODEL_PATH)
-        logger.info("💾 Model downloaded and cached")
-
-    # Embeddings
-    embedding_file = os.path.join(EMBEDDING_MODEL_PATH, "pytorch_model.bin")
-    os.makedirs(EMBEDDING_MODEL_PATH, exist_ok=True)
-    if not os.path.exists(embedding_file):
-        logger.info("⬇️ Downloading embedding model...")
-        st_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        st_model.save(EMBEDDING_MODEL_PATH)
-        logger.info("💾 Saved embeddings locally")
-    else:
-        logger.info("✅ Loading embeddings from local cache")
-        st_model = SentenceTransformer(EMBEDDING_MODEL_PATH)
-
-    GLOBAL_EMBEDDINGS = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL_PATH,
-        model_kwargs={"device": "cpu"}
+    # Check Ollama connection
+    if not check_ollama_connection():
+        raise ConnectionError("Cannot connect to Ollama. Please start Ollama service.")
+    
+    # Ensure models are available
+    ensure_models_available()
+    
+    # Initialize a simple tokenizer for text processing
+    try:
+        import tiktoken
+        GLOBAL_TOKENIZER = tiktoken.get_encoding("cl100k_base")
+    except ImportError:
+        # Fallback tokenizer
+        class SimpleTokenizer:
+            def encode(self, text):
+                return text.split()
+        GLOBAL_TOKENIZER = SimpleTokenizer()
+        logger.info("Using simple tokenizer (install tiktoken for better performance)")
+    
+    # Initialize Ollama LLM
+    GLOBAL_MODEL = OllamaLLM(
+        model=OLLAMA_MODEL_NAME,
+        temperature=0.7,
+        num_predict=2048,
     )
+    logger.info(f"✅ Ollama LLM ({OLLAMA_MODEL_NAME}) initialized")
 
-    # Chroma store
+    # Initialize Ollama Embeddings
+    GLOBAL_EMBEDDINGS = OllamaEmbeddings(
+        model=OLLAMA_EMBEDDING_MODEL,
+    )
+    logger.info(f"✅ Ollama Embeddings ({OLLAMA_EMBEDDING_MODEL}) initialized")
+
+    # Initialize Chroma vector store
     GLOBAL_VECTORSTORE = Chroma(
         persist_directory=CHROMA_PERSIST_DIR,
         embedding_function=GLOBAL_EMBEDDINGS
     )
+    
     doc_count = GLOBAL_VECTORSTORE._collection.count()
-    k = min(4, doc_count) if doc_count > 0 else 1
-    GLOBAL_RETRIEVER = GLOBAL_VECTORSTORE.as_retriever(search_kwargs={"k": k})
+    k = min(6, doc_count) if doc_count > 0 else 1
+    GLOBAL_RETRIEVER = GLOBAL_VECTORSTORE.as_retriever(
+        search_kwargs={"k": k, "fetch_k": 10}
+    )
 
-    logger.info("Global components initialized.")
+    logger.info("🚀 Global components initialized successfully")

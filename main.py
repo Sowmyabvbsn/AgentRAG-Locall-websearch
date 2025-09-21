@@ -1,7 +1,6 @@
 import os
 import uuid
 import hashlib
-import torch
 import threading
 import logging
 from typing import Generator, List, Optional, Dict
@@ -9,7 +8,6 @@ import gradio as gr
 import json
 import re
 import datetime
-from transformers import TextIteratorStreamer
 from langchain.docstore.document import Document
 from langchain.schema import SystemMessage
 from langchain.memory import ConversationBufferMemory
@@ -18,6 +16,8 @@ from duckduckgo_search import DDGS
 # Local imports
 import config
 import utils
+from multimodal_processor import MultiModalProcessor
+from citation_manager import CitationManager
 
 # Use the same logger
 logger = config.logger
@@ -28,77 +28,34 @@ CHROMA_PERSIST_DIR = config.CHROMA_PERSIST_DIR
 
 
 # ============================================
-# TemplateAgent
+# Enhanced CoTAgent with Ollama and Citations
 # ============================================
-class TemplateAgent:
-    def __init__(self, model, tokenizer):
-        self.model = model
-        self.tokenizer = tokenizer
-
-    def _postprocess_output(self, raw_output: str) -> str:
-        if "</think>" in raw_output:
-            return raw_output.split("</think>")[-1].strip()
-        return raw_output
-
-    def generate_template(self, question: str) -> str:
-        prompt = (
-            "You specialize in designing chain-of-thought templates. Provide a structured approach to solve user input "
-            "(e.g., 'Step 1: ...') without revealing any actual reasoning or final answer. "
-            "This template must be adaptable to any user query and remain purely an outline. "
-            f"\n\n{question}\n\n"
-            "Return only approach and steps for the reasoning steps and context, with no real details or final "
-            "solution.\n\n"
-            "Template:"
-        )
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        outputs = self.model.generate(**inputs, max_new_tokens=1024)
-        raw_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-        return self._postprocess_output(raw_output)
-
-    def clean_content(self, content: str) -> str:
-        if not content.strip():
-            return ""
-        prompt = (
-            "Clean and refine the following context to fix spacing/phrasing issues, ensuring the meaning is "
-            "preserved:\n\n"
-            f"{content}\n\nRefined Context:"
-        )
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        outputs = self.model.generate(**inputs, max_new_tokens=4096)
-        raw_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-        return self._postprocess_output(raw_output)
-
-
-# ============================================
-# CoTAgent
-# ============================================
-class CoTAgent:
+class EnhancedCoTAgent:
     def __init__(
         self,
         memory: Optional[ConversationBufferMemory] = None,
         model=None,
-        tokenizer=None,
         embeddings=None,
         vectorstore=None,
         retriever=None
     ):
         self.logger = logger
         self.model = model if model else config.GLOBAL_MODEL
-        self.tokenizer = tokenizer if tokenizer else config.GLOBAL_TOKENIZER
         self.embeddings = embeddings if embeddings else config.GLOBAL_EMBEDDINGS
         self.vectorstore = vectorstore if vectorstore else config.GLOBAL_VECTORSTORE
         self.retriever = retriever if retriever else config.GLOBAL_RETRIEVER
 
         self.retriever_cache: Dict[str, List] = {}
         self.system_message = (
-            "You are an AI assistant designed to solve problems and answer questions with clear, step-by-step reasoning. "
-            "Your goal is to provide accurate, comprehensive, and well-justified responses in English, leveraging retrieved context when applicable.\n\n"
-            "Provide a detailed and accurate answer, but avoid repeating information unless it adds new insight. Summarize key points concisely in your final response.\n"
-            "During your reasoning, you can take the following actions:\n"
-            "- <action>retrieve[query]</action> to retrieve additional info.\n"
-            "- <action>generate_template</action> to generate a reasoning template.\n"
-            "- <refine>...</refine> to refine a piece of text.\n"
-            "When ready to finalize: <final_answer>some answer</final_answer>."
+            "You are an advanced AI assistant powered by Llama2, designed to provide comprehensive, accurate, and well-researched responses. "
+            "You have access to a hybrid knowledge base that combines your training data with user-provided documents, images, audio transcriptions, and web content. "
+            "Your responses should be:\n"
+            "1. Accurate and factual\n"
+            "2. Well-structured and easy to understand\n"
+            "3. Comprehensive yet concise\n"
+            "4. Supported by evidence from your knowledge base\n"
+            "5. Include relevant context from retrieved documents when applicable\n\n"
+            "When answering questions, consider both your pre-trained knowledge and the retrieved context to provide the most complete and accurate response possible."
         )
 
         self.memory = memory if memory else ConversationBufferMemory(memory_key="chat_history", return_messages=True)
@@ -108,32 +65,42 @@ class CoTAgent:
         self.current_urls: List[str] = []
         self.update_urls(DEFAULT_URLS)
 
-        self.template_agent = TemplateAgent(self.model, self.tokenizer)
+        # Initialize multimodal processor and citation manager
+        self.multimodal_processor = MultiModalProcessor()
+        self.citation_manager = CitationManager()
 
     def _process_documents(self, docs: List[Document]):
+        """Process and add documents to vector store with enhanced metadata"""
         from langchain_community.vectorstores.utils import filter_complex_metadata
         new_docs = []
+        
         for doc in docs:
             doc_content = doc.page_content
 
-            # Detect multiple document types.
-            import re
+            # Enhanced document type detection
             doc_types = set()
-            # Detect code: look for code fences and typical code tokens.
-            if "```" in doc_content or "def " in doc_content or "import " in doc_content:
+            
+            # Detect code
+            if "```" in doc_content or any(keyword in doc_content for keyword in ["def ", "import ", "function", "class ", "var ", "let ", "const "]):
                 doc_types.add("code")
-            # Detect math symbols.
-            if any(math_sym in doc_content for math_sym in ["∫", "∑", "√", "π", "∞", "Δ", "lim"]):
+            
+            # Detect math
+            if any(math_sym in doc_content for math_sym in ["∫", "∑", "√", "π", "∞", "Δ", "lim", "equation", "formula"]):
                 doc_types.add("math")
-            # Remove code blocks to assess non-code text.
+            
+            # Detect academic content
+            if any(academic_term in doc_content.lower() for academic_term in ["abstract", "methodology", "conclusion", "references", "citation"]):
+                doc_types.add("academic")
+            
+            # Default to text if no specific type detected
             non_code_text = re.sub(r"```(.*?)```", "", doc_content, flags=re.DOTALL).strip()
             if non_code_text and len(non_code_text.split()) > 10:
                 doc_types.add("text")
-            # If no type is detected, default to text.
+            
             if not doc_types:
                 doc_types.add("text")
 
-            # Extract a candidate title or section header.
+            # Extract title or section header
             content_stripped = doc.page_content.strip()
             candidate_title = ""
             if content_stripped:
@@ -143,24 +110,30 @@ class CoTAgent:
                 elif len(first_line.split()) <= 10:
                     candidate_title = first_line
 
-            # Use adaptive splitting from utils.
+            # Use adaptive splitting
             chunks = utils.adaptive_sentence_based_split(doc.page_content, max_tokens=512)
+            
             for chunk in chunks:
                 clean_content = chunk.strip()
                 content_hash = hashlib.sha256(clean_content.encode()).hexdigest()
                 ingested_at = datetime.datetime.utcnow().isoformat()
 
-                # Create metadata with enforced fields and additional ingestion timestamp.
-                new_metadata = {**doc.metadata,
-                                "content_hash": content_hash,
-                                "ingested_at": ingested_at,
-                                "doc_type": list(doc_types)}
+                # Enhanced metadata
+                new_metadata = {
+                    **doc.metadata,
+                    "content_hash": content_hash,
+                    "ingested_at": ingested_at,
+                    "doc_type": list(doc_types),
+                    "chunk_length": len(clean_content),
+                    "word_count": len(clean_content.split())
+                }
+                
                 if candidate_title:
                     new_metadata["section_title"] = candidate_title
                 if "source" not in new_metadata:
                     new_metadata["source"] = "unknown"
 
-                # Filter out complex metadata types using provided utility:
+                # Filter complex metadata
                 filtered_docs = filter_complex_metadata([Document(page_content="", metadata=new_metadata)])
                 new_metadata = filtered_docs[0].metadata
 
@@ -170,144 +143,104 @@ class CoTAgent:
                 )
                 new_docs.append(new_doc)
 
+        # Check for existing documents
         existing_hashes = set()
         if self.vectorstore._collection.count() > 0:
             existing_data = self.vectorstore._collection.get(include=["metadatas"])
-            existing_hashes = {m["content_hash"] for m in existing_data["metadatas"]}
+            existing_hashes = {m.get("content_hash", "") for m in existing_data["metadatas"]}
 
         final_docs = [d for d in new_docs if d.metadata["content_hash"] not in existing_hashes]
+        
         if final_docs:
-            self.logger.info(f"🆕 Adding {len(final_docs)} new documents")
+            self.logger.info(f"🆕 Adding {len(final_docs)} new document chunks")
             self.vectorstore.add_documents(final_docs)
 
+        # Update retriever
         doc_count = self.vectorstore._collection.count()
-        k = min(4, doc_count) if doc_count > 0 else 1
+        k = min(6, doc_count) if doc_count > 0 else 1
         self.retriever = self.vectorstore.as_retriever(
-            search_kwargs={"k": k, "include_distances": True, "include_metadata": True}
+            search_kwargs={"k": k, "fetch_k": 10, "include_metadata": True}
         )
 
     def update_urls(self, new_urls: List[str]):
+        """Update URLs and process web content"""
         if set(new_urls) != set(self.current_urls):
-            self.logger.info("🔄 Updating document sources")
+            self.logger.info("🔄 Updating web document sources")
             self.current_urls = new_urls
+            
             from langchain_community.document_loaders import WebBaseLoader
             loader = WebBaseLoader(
                 web_paths=new_urls,
-                requests_kwargs={"headers": {"User-Agent": f"rag-agent/{uuid.uuid4()}"}}
+                requests_kwargs={"headers": {"User-Agent": f"enhanced-rag-agent/{uuid.uuid4()}"}}
             )
-            docs = loader.load()
-            for doc in docs:
-                if "source" not in doc.metadata:
-                    doc.metadata["source"] = "url"
-            self._process_documents(docs)
+            
+            try:
+                docs = loader.load()
+                for doc in docs:
+                    if "source" not in doc.metadata:
+                        doc.metadata["source"] = "web"
+                    doc.metadata["type"] = "web_content"
+                
+                self._process_documents(docs)
+                self.logger.info(f"✅ Processed {len(docs)} web documents")
+                
+            except Exception as e:
+                self.logger.error(f"Error loading web content: {e}")
         else:
             self.logger.info("✅ URLs unchanged")
 
-    def ingest_pdf_documents(self, file_paths: List[str]):
-        from langchain_community.document_loaders import PyPDFLoader
+    def ingest_multimodal_files(self, file_paths: List[str]) -> str:
+        """Process multiple types of files using multimodal processor"""
         all_docs = []
+        processed_files = []
+        
         for path in file_paths:
-            self.logger.info(f"Ingesting PDF: {path}")
+            self.logger.info(f"Processing file: {path}")
             try:
-                loader = PyPDFLoader(path)
-                docs = loader.load()
-                for doc in docs:
-                    doc.metadata["source"] = os.path.basename(path)
-                all_docs.extend(docs)
+                docs = self.multimodal_processor.process_file(path)
+                if docs:
+                    all_docs.extend(docs)
+                    processed_files.append(os.path.basename(path))
+                else:
+                    self.logger.warning(f"No content extracted from {path}")
+                    
             except Exception as e:
-                self.logger.error(f"Error processing PDF {path}: {e}")
+                self.logger.error(f"Error processing file {path}: {e}")
+        
         if all_docs:
             self._process_documents(all_docs)
-            return f"Uploaded and processed {len(all_docs)} documents from PDFs."
-        return "No valid PDF documents were processed."
+            return f"Successfully processed {len(processed_files)} files: {', '.join(processed_files)}"
+        
+        return "No valid files were processed."
 
-    def parse_action(self, text: str):
-        # Regex for actions
-        template_pattern = r"<action>generate_template</action>"
-        refine_pattern = r"<refine>(.*?)</refine>"
-        retrieve_pattern = r"<action>retrieve\[(.*?)\]</action>"
-        final_answer_pattern = r"<final_answer>(.*?)</final_answer>"
-
-        if re.search(template_pattern, text):
-            return "generate_template", None
-        elif re.search(refine_pattern, text):
-            m = re.search(refine_pattern, text)
-            return "refine_context", m.group(1).strip() if m else None
-        elif re.search(retrieve_pattern, text):
-            m = re.search(retrieve_pattern, text)
-            return "retrieve", m.group(1).strip() if m else None
-        elif re.search(final_answer_pattern, text):
-            return "final_answer", None
-
-        # Check for JSON-like
+    def search_query(self, query: str, max_results: int = 8) -> List[str]:
+        """Search for relevant URLs using DuckDuckGo"""
         try:
-            blocks = re.findall(r'\{.*?"command":.*?\}', text, re.DOTALL)
-            if blocks:
-                last_block = blocks[-1]
-                data = json.loads(last_block)
-                cmd = data.get("command", {}).get("name")
-                if cmd in ["generate_template", "refine_context", "retrieve", "final_answer"]:
-                    return cmd, None
-        except json.JSONDecodeError:
-            self.logger.warning("Failed to parse JSON-like command in text.")
+            results = DDGS().text(query, max_results=max_results)
+            return [r["href"] for r in results]
+        except Exception as e:
+            self.logger.error(f"Search error: {e}")
+            return []
 
-        return None, None
-
-    def search_query(self, query: str, max_results: int):
-        results = DDGS().text(query, max_results=max_results)
-        return [r["href"] for r in results]
-
-    def _format_response(self, text: str) -> str:
-        lines = text.splitlines()
-        formatted_lines = []
-        in_list = False
-        in_code_block = False
-
-        for line in lines:
-            # Check for the start or end of a code block
-            if line.strip().startswith("```"):
-                # Toggle code block state
-                in_code_block = not in_code_block
-                # Append the triple-backtick line as-is
-                formatted_lines.append(line)
-                continue
-
-            # If inside a code block, preserve indentation/spacing as-is
-            if in_code_block:
-                formatted_lines.append(line)
-                continue
-
-            # Otherwise (not in a code block), do your existing formatting:
-            line_stripped = line.strip()
-            if line_stripped.startswith(tuple(f"{i}." for i in range(1, 10))):
-                step_num = line_stripped.split(".")[0]
-                step_text = line_stripped.split(".", 1)[1].strip()
-                formatted_lines.append(f"**Step {step_num}** - {step_text}")
-                in_list = True
-            elif in_list and line_stripped:
-                formatted_lines.append(f"- {line_stripped}")
-            else:
-                formatted_lines.append(line_stripped)
-                in_list = False
-
-        return "\n".join(formatted_lines)
-
-    def generate_with_cot(self, question: str, urls: Optional[List[str]] = None, max_tokens: int = 1024) -> Generator[str, None, None]:
+    def generate_with_enhanced_context(self, question: str, urls: Optional[List[str]] = None, max_tokens: int = 2048) -> Generator[str, None, None]:
+        """Generate response with enhanced context and citations"""
         self.last_question = question
+        
+        # Search for relevant URLs if none provided
         if not urls or len(urls) == 0:
             urls = self.search_query(question, 8)
 
         if urls:
             self.update_urls(urls)
 
+        # Retrieve relevant documents
         cache_key = hashlib.sha256(question.encode()).hexdigest()
         if cache_key in self.retriever_cache:
             docs = self.retriever_cache[cache_key]
             self.logger.info("Using cached retriever results.")
         else:
             try:
-                # Use similarity_search_with_score to get similarity scores alongside docs.
-                docs_with_scores = self.vectorstore.similarity_search_with_score(question, k=4)
+                docs_with_scores = self.vectorstore.similarity_search_with_score(question, k=6)
                 docs = [doc for doc, score in docs_with_scores]
                 self.logger.info("Similarity scores: " + ", ".join(f"{score:.3f}" for _, score in docs_with_scores))
                 self.retriever_cache[cache_key] = docs
@@ -315,99 +248,50 @@ class CoTAgent:
                 self.logger.error(f"Error retrieving documents: {e}")
                 docs = []
 
-        raw_context = "\n".join(d.page_content for d in docs) if docs else ""
-        conversation = [
-            {"role": "system", "content": self.system_message},
-            {"role": "user", "content": f"Initial Context:\n{raw_context}\n\nQuestion: {question}"}
-        ]
-        full_response = ""
+        # Prepare context from retrieved documents
+        context_parts = []
+        if docs:
+            for i, doc in enumerate(docs, 1):
+                doc_type = doc.metadata.get('type', 'unknown')
+                source = doc.metadata.get('source', 'unknown')
+                context_parts.append(f"[Source {i} - {doc_type} from {source}]:\n{doc.page_content}\n")
 
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-            self.model.config.pad_token_id = self.tokenizer.eos_token_id
+        raw_context = "\n".join(context_parts) if context_parts else ""
+        
+        # Create enhanced prompt
+        enhanced_prompt = f"""Based on the following context from various sources and your knowledge, provide a comprehensive answer to the question.
 
-        iteration = 0
-        max_iterations = 5
+Context from Knowledge Base:
+{raw_context}
 
-        while iteration < max_iterations:
-            iteration += 1
-            if len(conversation) > 8:
-                conversation = [conversation[0]] + conversation[-6:]
+Question: {question}
 
-            # Qwen chat template
-            formatted_prompt = self.tokenizer.apply_chat_template(
-                conversation,
-                tokenize=False,
-                add_generation_prompt=True
-            )
-            inputs = self.tokenizer(formatted_prompt, return_tensors="pt", add_special_tokens=True).to(self.model.device)
-            streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
-            generation_kwargs = {
-                "input_ids": inputs.input_ids,
-                "attention_mask": inputs.attention_mask,
-                "max_new_tokens": max_tokens,
-                "repetition_penalty": 1.2,
-                "streamer": streamer,
-            }
-            import threading
-            thread = threading.Thread(target=self.model.generate, kwargs=generation_kwargs)
-            thread.start()
+Please provide a detailed, accurate response that:
+1. Combines information from the provided context with your knowledge
+2. Is well-structured and easy to understand
+3. Addresses all aspects of the question
+4. Mentions relevant sources when applicable
 
-            generated_text = ""
-            for new_text in streamer:
-                generated_text += new_text
-                full_response += new_text
-                yield self._format_response(full_response)
+Response:"""
 
-                action_type, action_data = self.parse_action(generated_text)
-                if action_type == "generate_template":
-                    try:
-                        template_str = self.template_agent.generate_template(self.last_question)
-                        observation = f"Observation: Here is a suggested template: {template_str}"
-                    except Exception as e:
-                        observation = "Observation: Could not generate template."
-                        self.logger.error(f"Template generation error: {e}")
-                    conversation.append({"role": "assistant", "content": generated_text})
-                    conversation.append({"role": "user", "content": observation})
-                    break
-                elif action_type == "refine_context":
-                    try:
-                        refined = self.template_agent.clean_content(action_data)
-                        observation = f"Observation: Refined context: {refined}"
-                    except Exception as e:
-                        observation = f"Observation: Could not refine context. Error: {e}"
-                    conversation.append({"role": "assistant", "content": generated_text})
-                    conversation.append({"role": "user", "content": observation})
-                    break
-                elif action_type == "retrieve":
-                    try:
-                        docs = self.retriever.invoke(action_data)
-                        raw_context = "\n".join([d.page_content for d in docs]) if docs else ""
-                        cleaned = self.template_agent.clean_content(raw_context)
-                        observation = f"Observation: {cleaned}"
-                    except Exception as e:
-                        observation = f"Observation: Retrieval error: {e}"
-                    conversation.append({"role": "assistant", "content": generated_text})
-                    conversation.append({"role": "user", "content": observation})
-                    break
-                elif action_type == "final_answer":
-                    thread.join()
-                    try:
-                        start_idx = generated_text.index("<final_answer>") + len("<final_answer>")
-                        end_idx = generated_text.index("</final_answer>")
-                        final_ans = generated_text[start_idx:end_idx].strip()
-                    except ValueError:
-                        final_ans = generated_text.strip()
-                    summary = f"\n\n**Summary of Key Points:**\n\n- {final_ans}\n\n"
-                    full_response += summary
-                    yield self._format_response(full_response)
-                    return
-
-            thread.join()
-            conversation.append({"role": "assistant", "content": generated_text})
-
-        yield self._format_response(full_response + "\n\n⚠️ Stopped: Maximum iterations reached.")
-        return
+        try:
+            # Generate response using Ollama
+            response_text = ""
+            for chunk in self.model.stream(enhanced_prompt):
+                response_text += chunk
+                yield response_text
+            
+            # Generate citations and related links
+            citations = self.citation_manager.generate_citations_for_response(response_text, question)
+            citation_text = self.citation_manager.format_citations_for_display(citations)
+            
+            # Add citations to response
+            final_response = response_text + citation_text
+            yield final_response
+            
+        except Exception as e:
+            self.logger.error(f"Error generating response: {e}")
+            yield f"❌ Error generating response: {str(e)}"
 
 
 # ============================================
@@ -416,40 +300,38 @@ class CoTAgent:
 AGENT_REGISTRY = {}
 
 def get_agent(session_id: str):
-    """
-    Return an existing agent or create a new one for this session.
-    """
+    """Return an existing agent or create a new one for this session"""
     if session_id not in AGENT_REGISTRY:
-        if config.GLOBAL_MODEL is None:
-            config.init_global_components()
+        try:
+            if config.GLOBAL_MODEL is None:
+                config.init_global_components()
+        except Exception as e:
+            logger.error(f"Failed to initialize global components: {e}")
+            raise ConnectionError("Cannot initialize Ollama components. Please ensure Ollama is running and models are available.")
 
         from langchain.memory import ConversationBufferMemory
-        from langchain_chroma import Chroma
-
+        
         memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-        vectorstore = Chroma(
-            persist_directory=config.CHROMA_PERSIST_DIR,
-            embedding_function=config.GLOBAL_EMBEDDINGS
-        )
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-
-        agent = CoTAgent(
+        
+        agent = EnhancedCoTAgent(
             memory=memory,
             model=config.GLOBAL_MODEL,
-            tokenizer=config.GLOBAL_TOKENIZER,
             embeddings=config.GLOBAL_EMBEDDINGS,
-            vectorstore=vectorstore,
-            retriever=retriever
+            vectorstore=config.GLOBAL_VECTORSTORE,
+            retriever=config.GLOBAL_RETRIEVER
         )
         AGENT_REGISTRY[session_id] = agent
+    
     return AGENT_REGISTRY[session_id]
 
 
 # ============================================
-# Gradio Interface
+# Gradio Interface Functions
 # ============================================
 def chat_interface(message: str, urls_text: str, agent_state: any, max_tokens: int) -> Generator[str, None, None]:
+    """Main chat interface"""
     urls = [u.strip() for u in urls_text.splitlines() if u.strip()] if urls_text.strip() else None
+    
     if isinstance(agent_state, dict):
         agent = agent_state.get("agent")
         if agent is None:
@@ -459,109 +341,273 @@ def chat_interface(message: str, urls_text: str, agent_state: any, max_tokens: i
         agent = get_agent(agent_state if agent_state else str(uuid.uuid4()))
 
     try:
-        yield from agent.generate_with_cot(message, urls, max_tokens)
+        yield from agent.generate_with_enhanced_context(message, urls, max_tokens)
     except Exception as e:
         logger.exception("Generation error:")
         msg = (
             f"❌ An error occurred: {e}\n"
-            "Try again or simplify the question. If it persists, check your environment."
+            "Please check that Ollama is running and the Llama2 model is available.\n"
+            "Run: `ollama serve` and `ollama pull llama2`"
         )
         yield msg
 
 def ingest_urls(urls_text: str) -> str:
-    if config.GLOBAL_MODEL is None:
-        config.init_global_components()
+    """Ingest URLs into the knowledge base"""
+    try:
+        if config.GLOBAL_MODEL is None:
+            config.init_global_components()
+    except Exception as e:
+        logger.error(f"Failed to initialize components: {e}")
+        return f"❌ System initialization failed: {str(e)}. Please ensure Ollama is running and models are available."
+    
     global_agent = get_agent(str(uuid.uuid4()))
-
     urls = [url.strip() for url in urls_text.splitlines() if url.strip()]
+    
     if not urls:
         return "No valid URLs provided."
-    global_agent.update_urls(urls)
-    return f"Updated with {len(urls)} URL(s)."
+    
+    try:
+        global_agent.update_urls(urls)
+        return f"Successfully ingested {len(urls)} URL(s) into the knowledge base."
+    except Exception as e:
+        logger.error(f"Error ingesting URLs: {e}")
+        return f"❌ Error processing URLs: {str(e)}"
 
-def ingest_pdfs(files: List) -> str:
-    if config.GLOBAL_MODEL is None:
-        config.init_global_components()
+def ingest_multimodal_files(files: List) -> str:
+    """Ingest various file types (PDFs, images, audio, documents)"""
+    try:
+        if config.GLOBAL_MODEL is None:
+            config.init_global_components()
+    except Exception as e:
+        logger.error(f"Failed to initialize components: {e}")
+        return f"❌ System initialization failed: {str(e)}. Please ensure Ollama is running and models are available."
+    
     global_agent = get_agent(str(uuid.uuid4()))
-
+    
     file_paths = []
     os.makedirs("temp_uploads", exist_ok=True)
-    for f in files or []:
-        if isinstance(f, str):
-            file_paths.append(f)
-        else:
-            tmp_path = os.path.join("temp_uploads", f.name)
-            with open(tmp_path, "wb") as out_file:
-                out_file.write(f.read())
-            file_paths.append(tmp_path)
+    
+    try:
+        for f in files or []:
+            if isinstance(f, str):
+                file_paths.append(f)
+            else:
+                tmp_path = os.path.join("temp_uploads", f.name)
+                with open(tmp_path, "wb") as out_file:
+                    out_file.write(f.read())
+                file_paths.append(tmp_path)
+    except Exception as e:
+        logger.error(f"Error processing uploaded files: {e}")
+        return f"❌ Error processing files: {str(e)}"
 
     if not file_paths:
-        return "No PDF files were uploaded."
-    return global_agent.ingest_pdf_documents(file_paths)
+        return "No files were uploaded."
+    
+    try:
+        return global_agent.ingest_multimodal_files(file_paths)
+    except Exception as e:
+        logger.error(f"Error ingesting files: {e}")
+        return f"❌ Error processing files: {str(e)}"
 
 
 # ============================================
-# Launch Gradio
+# Launch Enhanced Gradio Interface
 # ============================================
 if __name__ == "__main__":
     import gradio as gr
 
-    with gr.Blocks(title="AI Chat Assistant with Document Retrieval") as interface:
-        gr.Markdown("# AI Chat Assistant with Document Retrieval")
-        gr.Markdown("An intelligent assistant that can retrieve information from documents you provide.")
+    # Custom CSS for better styling
+    custom_css = """
+    .main-container { max-width: 1200px; margin: 0 auto; }
+    .chat-container { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+    .input-box textarea { 
+        font-size: 16px !important; 
+        padding: 15px !important; 
+        border-radius: 10px;
+        border: 2px solid #e1e5e9;
+        transition: border-color 0.3s ease;
+    }
+    .input-box textarea:focus {
+        border-color: #667eea;
+        box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+    }
+    .gr-button { 
+        background: linear-gradient(45deg, #667eea, #764ba2);
+        color: white; 
+        border: none; 
+        border-radius: 8px; 
+        padding: 12px 24px;
+        font-weight: 600;
+        transition: transform 0.2s ease;
+    }
+    .gr-button:hover { 
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+    }
+    .status-box {
+        background: #f8f9fa;
+        border-left: 4px solid #28a745;
+        padding: 15px;
+        border-radius: 5px;
+    }
+    @media (max-width: 768px) { 
+        .gr-row { flex-direction: column; } 
+        .gr-column { width: 100% !important; } 
+    }
+    """
+
+    with gr.Blocks(title="🤖 Enhanced RAG Assistant with Llama2", css=custom_css, theme=gr.themes.Soft()) as interface:
+        gr.HTML("""
+        <div style="text-align: center; padding: 20px;">
+            <h1 style="color: #333; margin-bottom: 10px;">🤖 Enhanced RAG Assistant</h1>
+            <h2 style="color: #666; font-weight: 300;">Powered by Ollama Llama2 with Multi-Modal Support</h2>
+            <p style="color: #888;">Upload PDFs, images, audio files, or provide URLs to build your knowledge base</p>
+        </div>
+        """)
 
         session_id = gr.State(value=str(uuid.uuid4()))
 
         with gr.Tabs():
-            with gr.Tab("Ask a Question"):
-                gr.Markdown("#### Ask me anything! Optionally specify URLs to consider.")
+            with gr.Tab("💬 Chat Assistant", elem_classes=["chat-container"]):
+                gr.Markdown("### Ask me anything! I can access your uploaded documents, images, audio, and web content.")
+                
                 with gr.Row():
                     with gr.Column(scale=1):
-                        user_input = gr.Textbox(lines=4, placeholder="Type your question...", label="Your Question")
+                        user_input = gr.Textbox(
+                            lines=4, 
+                            placeholder="Ask me about your documents, or any topic...", 
+                            label="Your Question",
+                            elem_classes=["input-box"]
+                        )
                         urls_optional = gr.Textbox(
                             label="Optional URLs (one per line)",
                             lines=3,
-                            placeholder="https://example.com/page1\nhttps://example.com/page2"
+                            placeholder="https://example.com/article1\nhttps://example.com/article2",
+                            elem_classes=["input-box"]
                         )
-                        max_tokens_slider = gr.Slider(512, 8192, step=256, value=1024, label="Max Tokens")
-                        submit_btn = gr.Button("Get Answer")
-                        reset_btn = gr.Button("New Chat")
+                        max_tokens_slider = gr.Slider(
+                            512, 4096, 
+                            step=256, 
+                            value=2048, 
+                            label="Max Response Length"
+                        )
+                        
+                        with gr.Row():
+                            submit_btn = gr.Button("🚀 Get Answer", variant="primary")
+                            reset_btn = gr.Button("🔄 New Chat", variant="secondary")
+                    
                     with gr.Column(scale=2):
-                        answer_output = gr.Markdown()
-                        feedback = gr.Slider(1, 5, step=1, label="Helpfulness? (1=bad,5=best)")
+                        answer_output = gr.Markdown(label="Response")
+                        
+                        with gr.Row():
+                            feedback = gr.Slider(
+                                1, 5, 
+                                step=1, 
+                                label="Rate this response (1=Poor, 5=Excellent)",
+                                visible=False
+                            )
 
-                submit_btn.click(fn=chat_interface, inputs=[user_input, urls_optional, session_id, max_tokens_slider],
-                                 outputs=answer_output)
-                reset_btn.click(lambda s: (str(uuid.uuid4()), ""), session_id, [session_id, answer_output])
+                submit_btn.click(
+                    fn=chat_interface, 
+                    inputs=[user_input, urls_optional, session_id, max_tokens_slider],
+                    outputs=answer_output
+                )
+                
+                reset_btn.click(
+                    lambda s: (str(uuid.uuid4()), ""), 
+                    inputs=session_id, 
+                    outputs=[session_id, answer_output]
+                )
 
-            with gr.Tab("Add Web Pages"):
-                gr.Markdown("### Add Web Pages for the Assistant to Use")
-                url_input = gr.Textbox(label="URLs", lines=5)
-                ingest_button = gr.Button("Add URLs")
-                ingest_status = gr.Textbox(label="Status")
+            with gr.Tab("🌐 Add Web Content"):
+                gr.Markdown("### 📚 Add Web Pages to Knowledge Base")
+                gr.Markdown("Provide URLs to articles, documentation, or any web content you want the assistant to reference.")
+                
+                url_input = gr.Textbox(
+                    label="URLs (one per line)", 
+                    lines=8,
+                    placeholder="https://en.wikipedia.org/wiki/Artificial_intelligence\nhttps://arxiv.org/abs/2103.00020",
+                    elem_classes=["input-box"]
+                )
+                ingest_button = gr.Button("📥 Add URLs to Knowledge Base", variant="primary")
+                ingest_status = gr.Textbox(label="Status", elem_classes=["status-box"])
 
                 ingest_button.click(fn=ingest_urls, inputs=url_input, outputs=ingest_status)
 
-            with gr.Tab("Upload PDFs"):
-                gr.Markdown("### Upload PDFs for the Assistant to Reference")
-                pdf_files = gr.File(label="Select PDFs", file_count="multiple", file_types=[".pdf"])
-                pdf_btn = gr.Button("Upload PDFs")
-                pdf_status = gr.Textbox(label="Upload Status")
+            with gr.Tab("📁 Upload Files"):
+                gr.Markdown("### 📎 Upload Multi-Modal Content")
+                gr.Markdown("""
+                **Supported file types:**
+                - 📄 **Documents**: PDF, TXT, MD
+                - 🖼️ **Images**: JPG, PNG, BMP, TIFF (text will be extracted using OCR)
+                - 🎵 **Audio**: MP3, WAV, M4A, FLAC (speech will be transcribed)
+                """)
+                
+                multimodal_files = gr.File(
+                    label="Select Files", 
+                    file_count="multiple", 
+                    file_types=[".pdf", ".txt", ".md", ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".mp3", ".wav", ".m4a", ".flac", ".ogg"]
+                )
+                upload_btn = gr.Button("🚀 Process Files", variant="primary")
+                upload_status = gr.Textbox(label="Processing Status", elem_classes=["status-box"])
 
-                pdf_btn.click(fn=ingest_pdfs, inputs=pdf_files, outputs=pdf_status)
+                upload_btn.click(fn=ingest_multimodal_files, inputs=multimodal_files, outputs=upload_status)
 
-        interface.css = """
-        body { font-family: 'Arial', sans-serif; }
-        .input-box textarea { font-size: 16px !important; padding: 15px !important; border-radius: 8px; }
-        .gr-button { background-color: #4CAF50; color: white; border: none; border-radius: 5px; padding: 10px 20px; }
-        .gr-button:hover { background-color: #45a049; }
-        .gr-slider { margin-top: 10px; }
-        @media (max-width: 768px) { .gr-row { flex-direction: column; } .gr-column { width: 100% !important; } }
-        """
+            with gr.Tab("ℹ️ System Info"):
+                gr.Markdown("""
+                ### 🔧 System Information
+                
+                **Model**: Ollama Llama2  
+                **Embeddings**: Nomic Embed Text  
+                **Vector Store**: Chroma DB  
+                **Capabilities**:
+                - 📝 Text processing and understanding
+                - 🖼️ Image text extraction (OCR)
+                - 🎵 Audio transcription
+                - 🌐 Web content ingestion
+                - 📚 Citation generation
+                - 🔗 Related link recommendations
+                
+                **Requirements**:
+                - Ollama must be running (`ollama serve`)
+                - Llama2 model must be available (`ollama pull llama2`)
+                - Nomic embedding model (`ollama pull nomic-embed-text`)
+                """)
+                
+                # System status check
+                def check_system_status():
+                    try:
+                        if config.check_ollama_connection():
+                            try:
+                                # Try to initialize components
+                                if config.GLOBAL_MODEL is None:
+                                    config.init_global_components()
+                                return "✅ System is ready! Ollama is running and models are available."
+                            except Exception as e:
+                                return f"⚠️ Ollama is running but models may not be available: {str(e)}\nTry running: ollama pull llama2 && ollama pull nomic-embed-text"
+                        else:
+                            return "❌ Cannot connect to Ollama. Please ensure Ollama is running with: ollama serve"
+                    except Exception as e:
+                        return f"❌ System check failed: {str(e)}"
+                
+                status_btn = gr.Button("🔍 Check System Status")
+                system_status = gr.Textbox(label="System Status")
+                status_btn.click(fn=check_system_status, outputs=system_status)
 
-    # Start
+    # Launch the interface
     try:
-        interface.launch(server_name="0.0.0.0", server_port=8000, show_error=True, share=True)
+        interface.launch(
+            server_name="0.0.0.0", 
+            server_port=8000, 
+            show_error=True, 
+            share=False,  # Set to True if you want a public link
+            inbrowser=True
+        )
     except OSError as e:
-        logger.error(f"Port error: {e}")
-        interface.launch(server_name="0.0.0.0", server_port=0, show_error=True)
+        logger.error(f"Port 8000 is busy: {e}")
+        interface.launch(
+            server_name="0.0.0.0", 
+            server_port=0, 
+            show_error=True,
+            inbrowser=True
+        )

@@ -1,21 +1,32 @@
-# Core LLM + Transformers + Quantization
-torch
-torchvision
-transformers
-accelerate
-bitsandbytes
+# Core Ollama Integration
+ollama
+langchain-ollama
 
-# LangChain + Extensions + Vector Store
-langchain_huggingface
-langchain_chroma
+# LangChain Core and Extensions
 langchain
 langchain-community
+langchain-chroma
 chromadb
-# Retrieval & Ingestion
-duckduckgo-search
+
+# Multi-modal Processing
+# Image Processing
+pillow
+opencv-python
+pytesseract
+easyocr
+
+# Audio Processing
+librosa
+soundfile
+openai-whisper
+
+# Document Processing
 pypdf
-# Sentence Embeddings
-sentence-transformers
+
+# Web Search and Scraping
+duckduckgo-search
+beautifulsoup4
+requests
 
 # NLP
 spacy
@@ -23,4 +34,6 @@ spacy
 # Frontend / UI
 gradio
 
-
+# Utilities
+numpy
+tiktoken
