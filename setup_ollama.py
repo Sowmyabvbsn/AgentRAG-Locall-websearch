@@ -85,7 +85,7 @@ def setup_ollama():
         logger.info("✅ Ollama is running")
     
     # Pull required models
-    models_to_pull = ["llama2", "nomic-embed-text"]
+    models_to_pull = ["llama3.2:1b", "nomic-embed-text"]
     
     for model in models_to_pull:
         if not pull_model(model):

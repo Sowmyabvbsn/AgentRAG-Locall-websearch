@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 GLOBAL_NLP = spacy.load("en_core_web_sm")
 
 # Ollama Model Configuration
-OLLAMA_MODEL_NAME = "llama2"
+OLLAMA_MODEL_NAME = "llama3.2:1b"  # Much smaller and faster model
 OLLAMA_EMBEDDING_MODEL = "nomic-embed-text"
 CHROMA_PERSIST_DIR = "chroma_db"
 DEFAULT_URLS = [
@@ -57,7 +57,7 @@ def ensure_models_available():
             model_names = [getattr(model, 'name', getattr(model, 'model', '')) for model in models]
         
         # Check for Llama2
-        if not any(OLLAMA_MODEL_NAME in name for name in model_names):
+        if not any("llama3.2:1b" in name for name in model_names):
             logger.info(f"📥 Pulling {OLLAMA_MODEL_NAME} model...")
             ollama.pull(OLLAMA_MODEL_NAME)
             logger.info(f"✅ {OLLAMA_MODEL_NAME} model ready")
@@ -77,7 +77,7 @@ def ensure_models_available():
             logger.info("✅ Models pulled successfully")
         except Exception as pull_error:
             logger.error(f"Failed to pull models: {pull_error}")
-            logger.error("Please manually run: ollama pull llama2 && ollama pull nomic-embed-text")
+            logger.error("Please manually run: ollama pull llama3.2:1b && ollama pull nomic-embed-text")
 
 def init_global_components():
     """
@@ -107,8 +107,13 @@ def init_global_components():
     # Initialize Ollama LLM
     GLOBAL_MODEL = OllamaLLM(
         model=OLLAMA_MODEL_NAME,
-        temperature=0.7,
-        num_predict=2048,
+        temperature=0.3,  # Lower temperature for faster, more focused responses
+        num_predict=1024,  # Reduced max tokens for faster generation
+        num_ctx=4096,  # Context window
+        top_k=10,  # Limit token sampling for speed
+        top_p=0.9,  # Nucleus sampling for efficiency
+        repeat_penalty=1.1,
+        stop=["\n\n\n"],  # Stop on multiple newlines to prevent rambling
     )
     logger.info(f"✅ Ollama LLM ({OLLAMA_MODEL_NAME}) initialized")
 

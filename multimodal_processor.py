@@ -6,6 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image
+from PIL.ExifTags import TAGS
 import pytesseract
 import easyocr
 import librosa
@@ -69,24 +70,57 @@ class MultiModalProcessor:
                 logger.error(f"Could not load image: {file_path}")
                 return []
             
+            # Get image metadata
+            pil_image = Image.open(file_path)
+            width, height = pil_image.size
+            image_format = pil_image.format
+            
+            # Extract EXIF data if available
+            exif_data = {}
+            if hasattr(pil_image, '_getexif') and pil_image._getexif():
+                exif = pil_image._getexif()
+                for tag_id, value in exif.items():
+                    tag = TAGS.get(tag_id, tag_id)
+                    exif_data[tag] = value
+            
             # Extract text using Tesseract
             tesseract_text = ""
             try:
-                tesseract_text = pytesseract.image_to_string(image)
+                # Preprocess image for better OCR
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                # Apply threshold to get better text recognition
+                _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                tesseract_text = pytesseract.image_to_string(thresh, config='--psm 6')
             except Exception as e:
                 logger.warning(f"Tesseract OCR failed: {e}")
             
             # Extract text using EasyOCR
             easyocr_text = ""
+            easyocr_confidence = []
             if self.easyocr_reader:
                 try:
                     results = self.easyocr_reader.readtext(image)
-                    easyocr_text = " ".join([result[1] for result in results])
+                    easyocr_text = " ".join([result[1] for result in results if result[2] > 0.5])  # Filter by confidence
+                    easyocr_confidence = [result[2] for result in results if result[2] > 0.5]
                 except Exception as e:
                     logger.warning(f"EasyOCR failed: {e}")
             
-            # Combine OCR results
-            combined_text = f"Tesseract OCR: {tesseract_text}\n\nEasyOCR: {easyocr_text}"
+            # Analyze image characteristics
+            image_analysis = self._analyze_image_content(image)
+            
+            # Combine all extracted information
+            content_parts = []
+            
+            if tesseract_text.strip():
+                content_parts.append(f"Text extracted (Tesseract): {tesseract_text.strip()}")
+            
+            if easyocr_text.strip():
+                avg_confidence = sum(easyocr_confidence) / len(easyocr_confidence) if easyocr_confidence else 0
+                content_parts.append(f"Text extracted (EasyOCR, confidence: {avg_confidence:.2f}): {easyocr_text.strip()}")
+            
+            content_parts.append(f"Image analysis: {image_analysis}")
+            
+            combined_text = "\n\n".join(content_parts)
             
             if combined_text.strip():
                 doc = Document(
@@ -95,16 +129,75 @@ class MultiModalProcessor:
                         "source": os.path.basename(file_path),
                         "type": "image",
                         "processed_by": "OCR",
-                        "ocr_methods": ["tesseract", "easyocr"]
+                        "ocr_methods": ["tesseract", "easyocr"],
+                        "image_width": width,
+                        "image_height": height,
+                        "image_format": image_format,
+                        "has_text": bool(tesseract_text.strip() or easyocr_text.strip()),
+                        "exif_data": exif_data
                     }
                 )
                 documents.append(doc)
-                logger.info(f"🖼️ Processed image: extracted {len(combined_text)} characters")
+                logger.info(f"🖼️ Processed image: {width}x{height} {image_format}, extracted {len(combined_text)} characters")
             
         except Exception as e:
             logger.error(f"Error processing image {file_path}: {e}")
         
         return documents
+    
+    def _analyze_image_content(self, image) -> str:
+        """Analyze image characteristics to provide context"""
+        try:
+            height, width = image.shape[:2]
+            
+            # Convert to different color spaces for analysis
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+            
+            # Basic image characteristics
+            analysis = []
+            
+            # Brightness analysis
+            brightness = np.mean(gray)
+            if brightness < 85:
+                analysis.append("dark image")
+            elif brightness > 170:
+                analysis.append("bright image")
+            else:
+                analysis.append("normal brightness")
+            
+            # Color analysis
+            color_std = np.std(hsv[:,:,1])  # Saturation standard deviation
+            if color_std < 30:
+                analysis.append("mostly grayscale/low color")
+            else:
+                analysis.append("colorful image")
+            
+            # Edge detection for content type
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.sum(edges > 0) / (width * height)
+            
+            if edge_density > 0.1:
+                analysis.append("high detail/text-heavy")
+            elif edge_density > 0.05:
+                analysis.append("moderate detail")
+            else:
+                analysis.append("low detail/simple")
+            
+            # Aspect ratio
+            aspect_ratio = width / height
+            if aspect_ratio > 2:
+                analysis.append("wide format")
+            elif aspect_ratio < 0.5:
+                analysis.append("tall format")
+            else:
+                analysis.append("standard format")
+            
+            return f"Image characteristics: {', '.join(analysis)} ({width}x{height}px)"
+            
+        except Exception as e:
+            logger.warning(f"Image analysis failed: {e}")
+            return "Image analysis unavailable"
     
     def process_audio(self, file_path: str) -> List[Document]:
         """Process audio files and extract text using speech recognition"""

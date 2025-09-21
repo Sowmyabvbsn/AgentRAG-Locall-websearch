@@ -341,7 +341,17 @@ def chat_interface(message: str, urls_text: str, agent_state: any, max_tokens: i
         agent = get_agent(agent_state if agent_state else str(uuid.uuid4()))
 
     try:
-        yield from agent.generate_with_enhanced_context(message, urls, max_tokens)
+        response_generator = agent.generate_with_enhanced_context(message, urls, max_tokens)
+        accumulated_response = ""
+        
+        for chunk in response_generator:
+            accumulated_response = chunk
+            yield accumulated_response
+            
+        # If no response was generated, provide a fallback
+        if not accumulated_response.strip():
+            yield "I apologize, but I wasn't able to generate a response. Please try rephrasing your question or check that the system is properly configured."
+            
     except Exception as e:
         logger.exception("Generation error:")
         msg = (
@@ -486,9 +496,9 @@ if __name__ == "__main__":
                             elem_classes=["input-box"]
                         )
                         max_tokens_slider = gr.Slider(
-                            512, 4096, 
-                            step=256, 
-                            value=2048, 
+                            256, 2048, 
+                            step=128, 
+                            value=1024, 
                             label="Max Response Length"
                         )
                         
@@ -510,7 +520,8 @@ if __name__ == "__main__":
                 submit_btn.click(
                     fn=chat_interface, 
                     inputs=[user_input, urls_optional, session_id, max_tokens_slider],
-                    outputs=answer_output
+                    outputs=answer_output,
+                    show_progress=True
                 )
                 
                 reset_btn.click(
@@ -539,7 +550,7 @@ if __name__ == "__main__":
                 gr.Markdown("""
                 **Supported file types:**
                 - 📄 **Documents**: PDF, TXT, MD
-                - 🖼️ **Images**: JPG, PNG, BMP, TIFF (text will be extracted using OCR)
+                - 🖼️ **Images**: JPG, PNG, BMP, TIFF, WEBP (text extraction + image analysis)
                 - 🎵 **Audio**: MP3, WAV, M4A, FLAC (speech will be transcribed)
                 """)
                 
@@ -557,12 +568,12 @@ if __name__ == "__main__":
                 gr.Markdown("""
                 ### 🔧 System Information
                 
-                **Model**: Ollama Llama2  
+                **Model**: Ollama Llama 3.2 1B (Optimized for Speed)  
                 **Embeddings**: Nomic Embed Text  
                 **Vector Store**: Chroma DB  
                 **Capabilities**:
                 - 📝 Text processing and understanding
-                - 🖼️ Image text extraction (OCR)
+                - 🖼️ Image text extraction (OCR) + visual analysis
                 - 🎵 Audio transcription
                 - 🌐 Web content ingestion
                 - 📚 Citation generation
@@ -570,7 +581,7 @@ if __name__ == "__main__":
                 
                 **Requirements**:
                 - Ollama must be running (`ollama serve`)
-                - Llama2 model must be available (`ollama pull llama2`)
+                - Llama 3.2 1B model must be available (`ollama pull llama3.2:1b`)
                 - Nomic embedding model (`ollama pull nomic-embed-text`)
                 """)
                 
@@ -584,7 +595,7 @@ if __name__ == "__main__":
                                     config.init_global_components()
                                 return "✅ System is ready! Ollama is running and models are available."
                             except Exception as e:
-                                return f"⚠️ Ollama is running but models may not be available: {str(e)}\nTry running: ollama pull llama2 && ollama pull nomic-embed-text"
+                                return f"⚠️ Ollama is running but models may not be available: {str(e)}\nTry running: ollama pull llama3.2:1b && ollama pull nomic-embed-text"
                         else:
                             return "❌ Cannot connect to Ollama. Please ensure Ollama is running with: ollama serve"
                     except Exception as e:
