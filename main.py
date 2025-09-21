@@ -561,7 +561,7 @@ if __name__ == "__main__":
 
     # Start
     try:
-        interface.launch(server_name="0.0.0.0", server_port=8000, show_error=True)
+        interface.launch(server_name="0.0.0.0", server_port=8000, show_error=True, share=True)
     except OSError as e:
         logger.error(f"Port error: {e}")
         interface.launch(server_name="0.0.0.0", server_port=0, show_error=True)

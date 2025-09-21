@@ -6,6 +6,8 @@ accelerate
 bitsandbytes
 
 # LangChain + Extensions + Vector Store
+langchain_huggingface
+langchain_chroma
 langchain
 langchain-community
 chromadb
